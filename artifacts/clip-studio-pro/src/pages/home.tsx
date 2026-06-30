@@ -862,33 +862,6 @@ export default function Home() {
 
   const clipCount = fields.length;
 
-  // ----- values driving the live preview -----
-  const wFrame = form.watch("frameStyle");
-  const wClip0 = form.watch("clips.0");
-  const preview =
-    sourceTab === "youtube"
-      ? {
-          headline: wClip0?.headline ?? "",
-          mode: (wClip0?.mode ?? "edited") as "edited" | "raw",
-          captions: wClip0?.captionsEnabled ?? true,
-          // Pro 2: the preview's narration indicator is on for either the intro hook OR a
-          // filled-in essay script (essay narration also speaks over the clip).
-          voiceover:
-            (wClip0?.voiceoverEnabled ?? false) ||
-            ((wClip0?.format ?? "essay") === "essay" && !!(wClip0?.essayScript ?? "").trim()),
-          hook:
-            (wClip0?.format ?? "essay") === "essay" && (wClip0?.essayScript ?? "").trim()
-              ? (wClip0?.essayScript ?? "").trim()
-              : (wClip0?.voiceoverHook ?? ""),
-        }
-      : {
-          headline: localForm.headline,
-          mode: localForm.mode,
-          captions: localForm.captionsEnabled,
-          voiceover: false,
-          hook: "",
-        };
-
   return (
     <div className="h-full bg-background text-foreground flex flex-col font-sans overflow-hidden">
       <AppHeader />
@@ -904,8 +877,8 @@ export default function Home() {
             Pick a source, mark your in/out points, and dispatch render jobs to the phone.
           </p>
 
-          <div className="grid lg:grid-cols-[1fr_320px] gap-6 items-start">
-            {/* LEFT — form */}
+          <div className="mx-auto w-full max-w-3xl">
+            {/* form (live preview removed in Pro 2) */}
             <div className="min-w-0">
               {/* source + frame toolbar */}
               <div className="flex flex-wrap gap-3 mb-5">
@@ -1507,18 +1480,6 @@ export default function Home() {
               )}
             </div>
 
-            {/* RIGHT — live preview (sticky on desktop) */}
-            <div className="lg:sticky lg:top-[84px]">
-              <LivePreview
-                headline={preview.headline}
-                mode={preview.mode}
-                frameStyle={wFrame}
-                captions={preview.captions}
-                voiceover={preview.voiceover}
-                hook={preview.hook}
-                handle={channelHandle}
-              />
-            </div>
           </div>
         </div>
       </main>
