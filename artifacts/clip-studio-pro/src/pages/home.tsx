@@ -861,6 +861,7 @@ export default function Home() {
   }, [selectedFile, localForm, validateLocalForm, queryClient, toast, form]);
 
   const clipCount = fields.length;
+  const wFrame = form.watch("frameStyle");
 
   return (
     <div className="h-full bg-background text-foreground flex flex-col font-sans overflow-hidden">
