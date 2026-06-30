@@ -47,8 +47,14 @@ export const clipsTable = pgTable("clips_pro2", {
   // Pro 2: the full essay narration script. User-supplied — they paste it from their own
   // Gemini app (built by the "Copy Gemini prompt" button). Piper TTS speaks the whole script
   // over the clip with the source audio ducked underneath. Distinct from the short
-  // voiceoverHook (intro-only) so both can coexist.
+  // voiceoverHook (intro-only) so both can coexist. Reused as the narration for every format.
   essayScript: text("essay_script"),
+  // Pro 2 multi-clip formats (narrative/contrast): JSON-encoded array of source segments
+  // [{youtubeUrl,startTime,endTime,sourceChannel?,label?}]. The processor downloads each and
+  // combines them into ONE intermediate video (narrative=concat in order, contrast=vstack of 2)
+  // before the normal composite pipeline runs. Null for single-clip formats (essay), which use
+  // the top-level youtubeUrl/startTime/endTime instead.
+  segments: text("segments"),
 });
 
 export const insertClipSchema = createInsertSchema(clipsTable).omit({

@@ -50,10 +50,20 @@ const clipEntrySchema = z.object({
   zoomMoments: z.string().optional().default(""),
   voiceoverEnabled: z.boolean().default(false),
   voiceoverHook: z.string().optional().default(""),
-  // Pro 2: the "transformative" editing format. Only "essay" is active in Phase 1.
+  // Pro 2: the "transformative" editing format.
   format: z.enum(["essay", "contrast", "narrative"]).default("essay"),
-  // Pro 2: the full essay narration script (pasted from Gemini). Spoken by Piper over the clip.
+  // Pro 2: the narration script (pasted from Gemini). Spoken by Piper over the clip. Reused by
+  // every format (essay / narrative / contrast).
   essayScript: z.string().optional().default(""),
+  // Pro 2 multi-clip formats: the ADDITIONAL moments beyond segment 1 (which is this clip's own
+  // URL + In/Out). Narrative = chapters 2..N; Contrast = Streamer B (exactly one). A blank
+  // youtubeUrl reuses the top-level link (same video, different range).
+  segments: z.array(z.object({
+    youtubeUrl: z.string().optional().default(""),
+    startTime: z.string().regex(/^\d{2}:\d{2}:\d{2}$/, "Must be HH:MM:SS"),
+    endTime: z.string().regex(/^\d{2}:\d{2}:\d{2}$/, "Must be HH:MM:SS"),
+    label: z.string().optional().default(""),
+  })).optional().default([]),
 }).superRefine((val, ctx) => {
   if (val.mode === "edited" && (!val.headline || val.headline.trim().length === 0)) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Headline required for Edited mode", path: ["headline"] });
@@ -89,6 +99,7 @@ const defaultClip = {
   voiceoverHook: "",
   format: "essay" as const,
   essayScript: "",
+  segments: [] as { youtubeUrl: string; startTime: string; endTime: string; label: string }[],
 };
 
 type SourceTab = "youtube" | "local";
@@ -220,6 +231,69 @@ function ToggleChip({
       </span>
       {label}
     </button>
+  );
+}
+
+/* ---------- Pro 2: extra segments editor (narrative chapters 2..N / contrast Streamer B) ----------
+   Segment 1 is always the clip's own URL + In/Out above; this edits the ADDITIONAL moments. Defined
+   at module scope so its useFieldArray is stable per clip (calling the hook inside the parent's
+   fields.map would violate the rules of hooks). */
+function SegmentEditor({ form, index, format }: { form: any; index: number; format: "narrative" | "contrast" }) {
+  const { fields, append, remove } = useFieldArray({ control: form.control, name: `clips.${index}.segments` as never });
+  const isContrast = format === "contrast";
+  const max = isContrast ? 1 : 3; // contrast: exactly 1 extra (Streamer B); narrative: up to 3 more (4 total)
+  return (
+    <div className="space-y-2.5">
+      {fields.map((f, si) => {
+        const s = form.watch(`clips.${index}.segments.${si}`) as { startTime?: string; endTime?: string } | undefined;
+        return (
+          <div key={f.id} className="rounded-lg border border-border bg-background/40 p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-mono uppercase tracking-[0.1em] text-muted-foreground">
+                {isContrast ? "Streamer B" : `Moment ${si + 2}`}
+              </span>
+              <button
+                type="button"
+                onClick={() => remove(si)}
+                className="w-6 h-6 grid place-items-center rounded-md border border-border text-muted-foreground hover:text-destructive hover:border-destructive/40 hover:bg-destructive/10 transition-colors"
+                aria-label="Remove segment"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+            <Input
+              placeholder="YouTube link (leave blank = same video as above)"
+              className="text-sm bg-background font-mono"
+              {...form.register(`clips.${index}.segments.${si}.youtubeUrl`)}
+            />
+            <div className="grid grid-cols-[1fr_1fr_auto] gap-2 items-end">
+              <div><FieldLabel>In</FieldLabel><Input placeholder="00:00:00" className="font-mono text-sm bg-background" {...form.register(`clips.${index}.segments.${si}.startTime`)} /></div>
+              <div><FieldLabel>Out</FieldLabel><Input placeholder="00:00:10" className="font-mono text-sm bg-background" {...form.register(`clips.${index}.segments.${si}.endTime`)} /></div>
+              <div className="font-mono text-[11px] text-primary border border-dashed border-primary/30 rounded-lg px-3 py-2.5 text-center whitespace-nowrap">
+                <span className="block text-[9px] text-muted-foreground/60 uppercase tracking-[0.12em]">Len</span>
+                {fmtDuration(s?.startTime ?? "00:00:00", s?.endTime ?? "00:00:00")}
+              </div>
+            </div>
+            {!isContrast && (
+              <Input
+                placeholder="Label (optional) — e.g. 'the build-up'"
+                className="text-sm bg-background"
+                {...form.register(`clips.${index}.segments.${si}.label`)}
+              />
+            )}
+          </div>
+        );
+      })}
+      {fields.length < max && (
+        <button
+          type="button"
+          onClick={() => append({ youtubeUrl: "", startTime: "00:00:00", endTime: "00:00:10", label: "" })}
+          className="w-full flex items-center justify-center gap-2 rounded-lg border border-dashed border-primary/40 text-primary text-[11px] font-mono uppercase tracking-[0.1em] py-2.5 hover:bg-primary/[0.06] transition-colors"
+        >
+          <Plus className="w-3.5 h-3.5" /> {isContrast ? "Add Streamer B" : "Add another moment"}
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -514,6 +588,45 @@ export default function Home() {
     }
   }
 
+  // Pro 2 — Narrative format. Builds a Gemini prompt for a STORY narration spanning all the
+  // moments (segment 1 = the clip's own URL + In/Out; the rest come from the segments editor).
+  // Structure: hook -> build-up -> payload (the big reaction) -> payoff. Same human-in-the-loop
+  // pattern; the user pastes the returned script into the Narrative Script box for Piper to read.
+  async function copyNarrativePrompt(index: number) {
+    const values = form.getValues();
+    const clip = values.clips[index];
+    if (!clip) return;
+    const moments = [
+      { youtubeUrl: values.youtubeUrl, startTime: clip.startTime, endTime: clip.endTime, label: "" },
+      ...(clip.segments ?? []),
+    ];
+    const totalDur = moments.reduce((acc, m) => acc + Math.max(0, toSecs(m.endTime) - toSecs(m.startTime)), 0);
+    const wordBudget = Math.max(20, Math.round(totalDur * 2.3));
+    const momentLines = moments
+      .map((m, i) => `  ${i + 1}. ${(m.youtubeUrl || values.youtubeUrl)} @ ${m.startTime}-${m.endTime}${m.label ? ` (${m.label})` : ""}`)
+      .join("\n");
+    const prompt =
+      `You are a story-driven video-essay writer for a faceless YouTube Shorts channel. ` +
+      `These ${moments.length} clips play back-to-back as ONE video. WATCH each in order, then write a single ` +
+      `SPOKEN narration that ties them into a story (this is what makes it "transformative"). ` +
+      `Structure it as four flowing parts (no headings, no labels):\n` +
+      `1) HOOK — a "what if" / "did you know" / bold question that opens the story and stops the scroll.\n` +
+      `2) BUILD-UP — set the stage: the rivalry, the stakes, what's happening before the big moment.\n` +
+      `3) PAYLOAD — narrate the climax (the big reaction) as it lands.\n` +
+      `4) PAYOFF — the result/fallout: how it changed things.\n\n` +
+      `Rules: conversational spoken English, present tense, no stage directions, no quotes, no markdown. ` +
+      `It is read aloud over the stitched clips so it MUST fit ~${totalDur}s — keep it to about ${wordBudget} words total, ` +
+      `pacing the four beats across the clips in order. Return ONLY the script text.\n\n` +
+      `Clips in order:\n${momentLines}\n` +
+      `Source channel: ${values.sourceChannel || "(unknown)"}`;
+    const ok = await copyTextToClipboard(prompt);
+    if (ok) {
+      toast({ title: "Narrative prompt copied", description: "Paste it into your Gemini app, then paste the story script back here." });
+    } else {
+      toast({ title: "Copy failed", description: "Couldn't access the clipboard. Long-press the box to copy manually.", variant: "destructive" });
+    }
+  }
+
   // Builds a Gemini prompt asking it to choose AUTO-ZOOM moments AND the best zoom TYPE
   // for each. Same human-in-the-loop pattern as the hook: server makes no AI calls — the
   // user pastes this into Gemini, then pastes the returned "second type" pairs back.
@@ -566,6 +679,30 @@ export default function Home() {
 
     for (const clip of values.clips) {
       try {
+        // Multi-clip formats: build the full ordered segment list. Segment 1 = this clip's own
+        // URL + In/Out; the rest come from the segments editor (blank link = reuse the top link).
+        const isMulti = clip.format === "narrative" || clip.format === "contrast";
+        const segments = isMulti
+          ? [
+              { youtubeUrl: values.youtubeUrl, startTime: clip.startTime, endTime: clip.endTime, label: "" },
+              ...(clip.segments ?? []).map((s) => ({
+                youtubeUrl: (s.youtubeUrl && s.youtubeUrl.trim()) ? s.youtubeUrl.trim() : values.youtubeUrl,
+                startTime: s.startTime,
+                endTime: s.endTime,
+                label: s.label ?? "",
+              })),
+            ]
+          : undefined;
+        if (isMulti && segments) {
+          if (clip.format === "narrative" && segments.length < 2) {
+            failReasons.push("Narrative needs at least 1 more moment (use “Add another moment”)");
+            continue;
+          }
+          if (clip.format === "contrast" && segments.length !== 2) {
+            failReasons.push("Contrast needs exactly Streamer A + Streamer B");
+            continue;
+          }
+        }
         const r = await fetch(`${API_BASE}/api/clips`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -585,6 +722,7 @@ export default function Home() {
             voiceoverHook: clip.voiceoverHook ?? "",
             format: clip.format ?? "essay",
             essayScript: clip.essayScript ?? "",
+            ...(segments ? { segments } : {}),
           }),
         });
         if (!r.ok) {
@@ -927,8 +1065,8 @@ export default function Home() {
                                 <div className="inline-flex bg-background border border-border rounded-lg p-[3px] gap-[3px]">
                                   {[
                                     { value: "essay", label: "Essay", enabled: true },
+                                    { value: "narrative", label: "Narrative", enabled: true },
                                     { value: "contrast", label: "Contrast", enabled: false },
-                                    { value: "narrative", label: "Narrative", enabled: false },
                                   ].map((o) => (
                                     <button
                                       key={o.value}
@@ -1072,6 +1210,42 @@ export default function Home() {
                                 <p className="text-[9.5px] text-muted-foreground/70 mt-1.5 font-mono leading-relaxed">
                                   Read over the clip with the source audio ducked underneath. Keep it within the clip length — longer scripts get cut off.
                                 </p>
+                              </div>
+                            )}
+
+                            {/* Pro 2: Narrative panel (edited + Narrative format). The In/Out above
+                                is Moment 1; add the rest here, then narrate the story across them. */}
+                            {!isRaw && fmt === "narrative" && (
+                              <div className="rounded-lg border border-[#9b7bff]/30 bg-gradient-to-b from-[#9b7bff]/[0.08] to-[#9b7bff]/[0.02] p-3 space-y-3">
+                                <p className="text-[10px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff] flex items-center gap-1.5">
+                                  <ScrollText className="w-3.5 h-3.5 text-[#9b7bff]" /> Story Moments
+                                  <span className="text-[8.5px] font-semibold tracking-[0.14em] text-[#b69dff] border border-[#9b7bff]/40 rounded px-1.5 py-0.5">PRO 2</span>
+                                </p>
+                                <p className="text-[9.5px] text-muted-foreground/70 font-mono leading-relaxed -mt-1">
+                                  Moment 1 = the link + In/Out above. Add the next chapters below; they play back-to-back into one story.
+                                </p>
+                                <SegmentEditor form={form} index={index} format="narrative" />
+
+                                <div className="border-t border-[#9b7bff]/15 pt-3">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff] flex items-center gap-1.5">
+                                      <Mic className="w-3.5 h-3.5 text-[#9b7bff]" /> Narrative Script
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => copyNarrativePrompt(index)}
+                                      className="text-[10px] font-mono uppercase tracking-[0.08em] text-[#b69dff] hover:underline flex items-center gap-1.5 shrink-0"
+                                    >
+                                      <ClipboardCopy className="w-3 h-3" /> Copy Gemini prompt
+                                    </button>
+                                  </div>
+                                  <Textarea
+                                    placeholder="Paste your Gemini story script — hook → build-up → the big reaction → payoff. The voice reads it across all the moments."
+                                    rows={4}
+                                    className="text-sm bg-background mt-2.5 leading-relaxed"
+                                    {...form.register(`clips.${index}.essayScript`)}
+                                  />
+                                </div>
                               </div>
                             )}
                           </div>

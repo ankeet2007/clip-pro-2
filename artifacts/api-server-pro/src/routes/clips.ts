@@ -64,7 +64,8 @@ function dispatchClipJob(
   punchInEnabled = false,
   zoomMoments = "",
   format = "essay",
-  essayScript = ""
+  essayScript = "",
+  segments: string | null = null
 ) {
   const { channelHandle } = readSettings();
 
@@ -80,7 +81,7 @@ function dispatchClipJob(
       logger.error({ err, clipId }, "Failed to mark clip as processing");
     }
 
-    await processClip(youtubeUrl, startTime, endTime, headline, outputFilename, mode, channelHandle, clipId, localFilePath, frameStyle, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, format, essayScript)
+    await processClip(youtubeUrl, startTime, endTime, headline, outputFilename, mode, channelHandle, clipId, localFilePath, frameStyle, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, format, essayScript, segments)
       .then(async () => {
         await db
           .update(clipsTable)
@@ -119,10 +120,13 @@ router.post("/clips", async (req, res): Promise<void> => {
   const zoomMoments = (req.body as { zoomMoments?: string }).zoomMoments ?? "";
   const format = (req.body as { format?: string }).format ?? "essay";
   const essayScript = (req.body as { essayScript?: string }).essayScript ?? "";
+  // Multi-clip formats send a segments array; store it JSON-encoded (null for single-clip).
+  const segmentsRaw = (req.body as { segments?: unknown }).segments;
+  const segments = Array.isArray(segmentsRaw) && segmentsRaw.length > 0 ? JSON.stringify(segmentsRaw) : null;
 
   const [clip] = await db
     .insert(clipsTable)
-    .values({ youtubeUrl, startTime, endTime, headline, mode, frameStyle, sourceChannel, captionsEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, outroEnabled, format, essayScript, sourceType: "youtube", status: "pending" })
+    .values({ youtubeUrl, startTime, endTime, headline, mode, frameStyle, sourceChannel, captionsEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, outroEnabled, format, essayScript, segments, sourceType: "youtube", status: "pending" })
     .returning();
 
   if (!clip) {
@@ -133,7 +137,7 @@ router.post("/clips", async (req, res): Promise<void> => {
   res.status(201).json(GetClipResponse.parse(clip));
 
   const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
-  dispatchClipJob(clip.id, youtubeUrl, startTime, endTime, headline, outputFilename, mode, frameStyle, undefined, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, format, essayScript);
+  dispatchClipJob(clip.id, youtubeUrl, startTime, endTime, headline, outputFilename, mode, frameStyle, undefined, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, format, essayScript, segments);
 });
 
 /**
@@ -351,9 +355,11 @@ router.post("/clips/:id/retry", async (req, res): Promise<void> => {
     // be dropped because they weren't stored / were hardcoded on the retry path.
     clip.punchInEnabled ?? false,
     clip.zoomMoments ?? "",
-    // Pro 2: re-render in the same transformative format with the same pasted essay script.
+    // Pro 2: re-render in the same transformative format with the same pasted essay script
+    // and the same multi-clip segment list.
     clip.format ?? "essay",
-    clip.essayScript ?? ""
+    clip.essayScript ?? "",
+    clip.segments ?? null
   );
 });
 

@@ -607,6 +607,114 @@ async function downloadSegment(
   throw lastError;
 }
 
+// Pro 2 multi-clip formats. One render job has several source segments that must be combined
+// into ONE intermediate video BEFORE the normal composite pipeline runs (which assumes a single
+// [0:v] input). We download each segment (reusing downloadSegment's HD-floor logic), normalise
+// every segment to an identical 1920x1080@30 + 48k-stereo container (so they can be joined without
+// codec/dimension mismatch — clips that lack audio get a silent track), then:
+//   - narrative -> concat the normalised files in order (one continuous story)
+//   - contrast  -> vstack two normalised files (Streamer A over Streamer B), trimmed to the shorter
+// Returns the path to the combined file, which becomes tmpInputPath. CPU-heavy (one re-encode per
+// segment) so we cap the count and run -threads 1 to stay within the phone's memory.
+interface ClipSegment { youtubeUrl: string; startTime: string; endTime: string; }
+
+const MAX_SEGMENTS = 4;
+const NORM_FPS = 30;
+// Per-format normalisation geometry (chosen so the combined video isn't distorted when the
+// composite later scales it into the 1080x1350 video window):
+//   - narrative: 1920x1080 landscape, aspect preserved by letterbox (decrease+pad) so chapters
+//     of differing aspect ratios still concat cleanly.
+//   - contrast: each segment fills a 1080x675 half (cover+crop, no squish); two halves vstack to
+//     1080x1350 — already the portrait video window's aspect, so faces stay correctly shaped.
+const NARR_W = 1920, NARR_H = 1080;
+const CONTRAST_W = 1080, CONTRAST_HALF_H = 675; // 675*2 = 1350
+
+async function combineSegments(
+  ytDlp: string,
+  segments: ClipSegment[],
+  format: "narrative" | "contrast",
+  tmpId: string,
+  onProgress: (pct: number) => void,
+): Promise<string> {
+  const tmpDir = os.tmpdir();
+  if (format === "contrast" && segments.length !== 2) {
+    throw new Error("Contrast format needs exactly 2 segments (Streamer A and Streamer B)");
+  }
+  const segs = segments.slice(0, MAX_SEGMENTS);
+  if (segs.length < 2) throw new Error("Multi-clip formats need at least 2 segments");
+
+  // 1) Download + normalise each segment to a uniform container so they can be joined.
+  const normalised: string[] = [];
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i]!;
+    const segTmpId = `${tmpId}_seg${i}`;
+    // Download (HD floor enforced inside). Spread the 5-45% download band across segments.
+    const base = 5 + Math.round((i / segs.length) * 35);
+    const raw = await downloadSegment(ytDlp, s.youtubeUrl, s.startTime, s.endTime, segTmpId, (p) => {
+      onProgress(base + Math.round((p / 100) * (35 / segs.length)));
+    });
+
+    // Does this segment have an audio stream? If not, synth a silent one so concat/vstack stay aligned.
+    let segHasAudio = false;
+    try {
+      const probe = await execFileAsync("ffprobe", [
+        "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", raw,
+      ], { timeout: 15000 });
+      segHasAudio = probe.stdout.trim().length > 0;
+    } catch { /* assume none */ }
+
+    const norm = path.join(tmpDir, `clipnorm_${segTmpId}.mp4`);
+    // narrative -> letterbox into 1920x1080 (decrease+pad); contrast -> cover a 1080x675 half
+    // (increase+crop) so the two halves stack to a clean 1080x1350 without squishing.
+    const vNorm = format === "contrast"
+      ? `scale=${CONTRAST_W}:${CONTRAST_HALF_H}:force_original_aspect_ratio=increase,crop=${CONTRAST_W}:${CONTRAST_HALF_H},setsar=1,fps=${NORM_FPS}`
+      : `scale=${NARR_W}:${NARR_H}:force_original_aspect_ratio=decrease,pad=${NARR_W}:${NARR_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${NORM_FPS}`;
+    const normArgs = segHasAudio
+      ? ["-y", "-i", raw, "-vf", vNorm,
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-ar", "48000", "-ac", "2", "-threads", "1", norm]
+      : ["-y", "-i", raw, "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+         "-vf", vNorm, "-shortest",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-ar", "48000", "-ac", "2", "-threads", "1", norm];
+    await spawnProcess("ffmpeg", normArgs, 600_000, () => {});
+    if (!fs.existsSync(norm)) throw new Error(`Failed to normalise segment ${i + 1}`);
+    normalised.push(norm);
+    // Free the raw download immediately to save space/memory.
+    try { fs.existsSync(raw) && fs.unlinkSync(raw); } catch { /* ignore */ }
+  }
+
+  onProgress(46);
+  const combined = path.join(tmpDir, `clipcombined_${tmpId}.mp4`);
+
+  if (format === "narrative") {
+    // Concat the normalised files (identical params) via the concat demuxer — a cheap stream copy.
+    const listPath = path.join(tmpDir, `clipconcat_${tmpId}.txt`);
+    fs.writeFileSync(listPath, normalised.map((f) => `file '${f}'`).join("\n") + "\n");
+    await spawnProcess("ffmpeg", [
+      "-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", "-movflags", "+faststart", combined,
+    ], 300_000, () => {});
+    try { fs.unlinkSync(listPath); } catch { /* ignore */ }
+  } else {
+    // Contrast: the two normalised halves are already 1080x675 — stack A over B and trim to the
+    // shorter via -shortest. Keep Streamer A's audio under the narration.
+    await spawnProcess("ffmpeg", [
+      "-y", "-i", normalised[0]!, "-i", normalised[1]!,
+      "-filter_complex", `[0:v][1:v]vstack=inputs=2[v]`,
+      "-map", "[v]", "-map", "0:a",
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+      "-c:a", "aac", "-ar", "48000", "-ac", "2", "-shortest", "-threads", "1",
+      "-movflags", "+faststart", combined,
+    ], 600_000, () => {});
+  }
+
+  // Clean up the normalised intermediates.
+  for (const f of normalised) { try { fs.existsSync(f) && fs.unlinkSync(f); } catch { /* ignore */ } }
+  if (!fs.existsSync(combined)) throw new Error("Failed to combine segments");
+  onProgress(48);
+  return combined;
+}
+
 // The six AI auto-zoom effects. Gemini picks one per moment; the ffmpeg expressions
 // for each are built in processClip (all sharp lanczos scale+crop — never zoompan).
 type ZoomType = "punch" | "whip" | "cut" | "pushin" | "pullout" | "kenburns";
@@ -695,7 +803,10 @@ export async function processClip(
   // user pasted from Gemini. In essay mode Piper speaks the whole essayScript over the clip with
   // the source audio ducked underneath (the short voiceoverHook stays the intro-only path).
   format = "essay",
-  essayScript = ""
+  essayScript = "",
+  // Pro 2 multi-clip formats: JSON array of source segments to combine into one video before
+  // compositing (narrative=concat, contrast=vstack). Null/absent for single-clip formats.
+  segments: string | null = null,
 ): Promise<void> {
   const isLocalFile = !!localFilePath;
   const ytDlp = findYtDlp();
@@ -704,7 +815,24 @@ export async function processClip(
 
   const startSeconds = timeToSeconds(startTime);
   const endSeconds = timeToSeconds(endTime);
-  const duration = endSeconds - startSeconds;
+  // Reassignable: when several segments are combined, the real duration is re-probed from the
+  // combined file (it drives outro/caption/audio-fade timing downstream).
+  let duration = endSeconds - startSeconds;
+
+  // Parse the multi-clip segment list (if any) up front so we can branch the download step.
+  const isMultiClip = (format === "narrative" || format === "contrast") && !!segments;
+  let parsedSegments: ClipSegment[] = [];
+  if (isMultiClip) {
+    try {
+      const arr = JSON.parse(segments!) as ClipSegment[];
+      parsedSegments = (Array.isArray(arr) ? arr : []).filter(
+        (s) => s && s.youtubeUrl && s.startTime && s.endTime,
+      );
+    } catch (e) {
+      throw new Error(`Invalid segments for ${format} format: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (parsedSegments.length < 2) throw new Error(`${format} format needs at least 2 valid segments`);
+  }
 
   if (duration <= 0) throw new Error("End time must be after start time");
 
@@ -721,6 +849,28 @@ export async function processClip(
       tmpInputPath = localFilePath;
       logger.info({ tmpInputPath, mode }, "Using local uploaded file");
       await updateProgress(5, true);
+    } else if (isMultiClip) {
+      // Step 1 (multi-clip): download every segment and combine into ONE video (narrative=concat,
+      // contrast=vstack). The combined file then flows through the normal composite pipeline.
+      await updateProgress(0, true);
+      tmpInputPath = await combineSegments(
+        ytDlp,
+        parsedSegments,
+        format as "narrative" | "contrast",
+        tmpId,
+        (pct) => { void updateProgress(pct); },
+      );
+      // The combined clip's real length differs from the first segment's — re-probe it so the
+      // outro, caption cutoff and audio fade all line up with the actual video.
+      try {
+        const dp = await execFileAsync("ffprobe", [
+          "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", tmpInputPath,
+        ], { timeout: 15000 });
+        const probed = parseFloat(dp.stdout.trim());
+        if (probed > 0) duration = probed;
+      } catch { /* keep the estimate */ }
+      logger.info({ tmpInputPath, format, segments: parsedSegments.length, duration }, "Segments combined");
+      await updateProgress(48, true);
     } else {
       // Step 1 (YouTube): download the exact segment — reports 2-48% progress
       await updateProgress(0, true);
