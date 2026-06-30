@@ -627,6 +627,43 @@ export default function Home() {
     }
   }
 
+  // Pro 2 — Contrast format. Builds a Gemini prompt for COMPARISON narration over two streamers
+  // reacting to the same moment (Streamer A = the clip's URL + In/Out; Streamer B = the one extra
+  // segment). The two play side-by-side (A top, B bottom); the script contrasts their reactions.
+  async function copyContrastPrompt(index: number) {
+    const values = form.getValues();
+    const clip = values.clips[index];
+    if (!clip) return;
+    const b = (clip.segments ?? [])[0];
+    const aDur = Math.max(0, toSecs(clip.endTime) - toSecs(clip.startTime));
+    const bDur = b ? Math.max(0, toSecs(b.endTime) - toSecs(b.startTime)) : aDur;
+    const dur = Math.min(aDur, bDur); // side-by-side plays for the shorter of the two
+    const wordBudget = Math.max(15, Math.round(dur * 2.3));
+    const aUrl = values.youtubeUrl;
+    const bUrl = (b && b.youtubeUrl && b.youtubeUrl.trim()) ? b.youtubeUrl.trim() : values.youtubeUrl;
+    const prompt =
+      `You are a meta-commentary video editor for a faceless YouTube Shorts channel. Two streamers ` +
+      `react to the SAME moment and play SIDE-BY-SIDE (Streamer A on top, Streamer B on bottom). ` +
+      `WATCH both, then write a single SPOKEN narration that COMPARES their reactions — this layer of ` +
+      `analysis above the footage is what makes it "transformative". Structure it as three flowing ` +
+      `parts (no headings, no labels):\n` +
+      `1) SET UP the comparison in one line (same moment, two very different reactions).\n` +
+      `2) CONTRAST them: what A focuses on vs what B focuses on, and what that reveals about each.\n` +
+      `3) VERDICT: whose reaction is more insightful / telling, and why.\n\n` +
+      `Rules: conversational spoken English, present tense, no stage directions, no quotes, no markdown. ` +
+      `It is read aloud over the side-by-side clip so it MUST fit ~${dur}s — keep it to about ${wordBudget} words. ` +
+      `Return ONLY the script text.\n\n` +
+      `Streamer A (top): ${aUrl} @ ${clip.startTime}-${clip.endTime}\n` +
+      `Streamer B (bottom): ${bUrl}${b ? ` @ ${b.startTime}-${b.endTime}` : " (add Streamer B's In/Out)"}\n` +
+      `The shared moment / context: ${clip.headline || "(add a headline describing the moment)"}`;
+    const ok = await copyTextToClipboard(prompt);
+    if (ok) {
+      toast({ title: "Contrast prompt copied", description: "Paste it into your Gemini app, then paste the comparison script back here." });
+    } else {
+      toast({ title: "Copy failed", description: "Couldn't access the clipboard. Long-press the box to copy manually.", variant: "destructive" });
+    }
+  }
+
   // Builds a Gemini prompt asking it to choose AUTO-ZOOM moments AND the best zoom TYPE
   // for each. Same human-in-the-loop pattern as the hook: server makes no AI calls — the
   // user pastes this into Gemini, then pastes the returned "second type" pairs back.
@@ -1066,7 +1103,7 @@ export default function Home() {
                                   {[
                                     { value: "essay", label: "Essay", enabled: true },
                                     { value: "narrative", label: "Narrative", enabled: true },
-                                    { value: "contrast", label: "Contrast", enabled: false },
+                                    { value: "contrast", label: "Contrast", enabled: true },
                                   ].map((o) => (
                                     <button
                                       key={o.value}
@@ -1241,6 +1278,42 @@ export default function Home() {
                                   </div>
                                   <Textarea
                                     placeholder="Paste your Gemini story script — hook → build-up → the big reaction → payoff. The voice reads it across all the moments."
+                                    rows={4}
+                                    className="text-sm bg-background mt-2.5 leading-relaxed"
+                                    {...form.register(`clips.${index}.essayScript`)}
+                                  />
+                                </div>
+                              </div>
+                            )}
+
+                            {/* Pro 2: Contrast panel (edited + Contrast format). Streamer A = the
+                                link + In/Out above; add Streamer B below; they play side-by-side. */}
+                            {!isRaw && fmt === "contrast" && (
+                              <div className="rounded-lg border border-[#9b7bff]/30 bg-gradient-to-b from-[#9b7bff]/[0.08] to-[#9b7bff]/[0.02] p-3 space-y-3">
+                                <p className="text-[10px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff] flex items-center gap-1.5">
+                                  <Eye className="w-3.5 h-3.5 text-[#9b7bff]" /> Side-by-Side Compare
+                                  <span className="text-[8.5px] font-semibold tracking-[0.14em] text-[#b69dff] border border-[#9b7bff]/40 rounded px-1.5 py-0.5">PRO 2</span>
+                                </p>
+                                <p className="text-[9.5px] text-muted-foreground/70 font-mono leading-relaxed -mt-1">
+                                  Streamer A (top) = the link + In/Out above. Add Streamer B (bottom) reacting to the SAME moment — they show stacked, A over B.
+                                </p>
+                                <SegmentEditor form={form} index={index} format="contrast" />
+
+                                <div className="border-t border-[#9b7bff]/15 pt-3">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff] flex items-center gap-1.5">
+                                      <Mic className="w-3.5 h-3.5 text-[#9b7bff]" /> Comparison Script
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => copyContrastPrompt(index)}
+                                      className="text-[10px] font-mono uppercase tracking-[0.08em] text-[#b69dff] hover:underline flex items-center gap-1.5 shrink-0"
+                                    >
+                                      <ClipboardCopy className="w-3 h-3" /> Copy Gemini prompt
+                                    </button>
+                                  </div>
+                                  <Textarea
+                                    placeholder="Paste your Gemini comparison script — how A's reaction differs from B's, and whose is more telling. Read over the side-by-side clip."
                                     rows={4}
                                     className="text-sm bg-background mt-2.5 leading-relaxed"
                                     {...form.register(`clips.${index}.essayScript`)}
