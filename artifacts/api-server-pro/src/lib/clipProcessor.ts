@@ -1,0 +1,1306 @@
+import { execFile, spawn } from "child_process";
+import { promisify } from "util";
+import path from "path";
+import fs from "fs";
+import os from "os";
+import { inArray, eq } from "drizzle-orm";
+import { db, clipsTable } from "@workspace/db-pro";
+import { logger } from "./logger";
+
+const execFileAsync = promisify(execFile);
+
+const OUTPUT_DIR = process.env.CLIPS_OUTPUT_DIR ?? path.join(os.homedir(), "myapp", "clips_output");
+const UPLOADS_DIR = process.env.UPLOADS_DIR ?? path.join(os.homedir(), "myapp", "uploads");
+// Media helper scripts (whisper captions, Piper voiceover, karaoke ASS). Read them from this
+// repo's own scripts/ dir so Pro 2 is self-contained and never shares script files with Pro
+// (env-overridable for unusual deploys). Defaults to <workspace>/scripts via findWorkspaceRoot.
+const SCRIPTS_DIR = process.env.SCRIPTS_DIR ?? path.join(findWorkspaceRoot(), "scripts");
+const FONTS_DIR = path.join(findWorkspaceRoot(), "assets", "fonts");
+const WATERMARK_FONT = path.join(FONTS_DIR, "Sora-SemiBold.ttf");
+const ANTON_FONT = path.join(FONTS_DIR, "Anton-Regular.ttf");
+const COOKIES_FILE = path.join(os.tmpdir(), "youtube_cookies.txt");
+
+/**
+ * If the YOUTUBE_COOKIES env var is set, writes its content to a temp file
+ * and returns ["--cookies", "<path>"] to append to the yt-dlp command.
+ * This unlocks higher-quality formats on live recordings and age-restricted videos.
+ */
+function getCookiesArgs(): string[] {
+  const cookies = process.env.YOUTUBE_COOKIES;
+  if (!cookies || !cookies.trim()) return [];
+  try {
+    fs.writeFileSync(COOKIES_FILE, cookies.trim(), { mode: 0o600 });
+    logger.info("YouTube cookies loaded — high-quality formats unlocked");
+    return ["--cookies", COOKIES_FILE];
+  } catch (err) {
+    logger.warn({ err }, "Failed to write YouTube cookies file — continuing without cookies");
+    return [];
+  }
+}
+
+// Clean regular weight for headline text — matches reference style
+const CAPTION_FONTS = [
+  path.join(FONTS_DIR, "SpaceGrotesk.ttf"),
+  "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+];
+
+// --- Simple concurrency queue: max 2 simultaneous jobs ---
+const MAX_CONCURRENT = 1;
+let activeJobs = 0;
+const jobQueue: Array<() => void> = [];
+
+function drainQueue() {
+  while (activeJobs < MAX_CONCURRENT && jobQueue.length > 0) {
+    const next = jobQueue.shift()!;
+    activeJobs++;
+    next();
+  }
+}
+
+export function enqueueClipJob(fn: () => Promise<void>): void {
+  jobQueue.push(() => {
+    fn().finally(() => {
+      activeJobs--;
+      drainQueue();
+    });
+  });
+  drainQueue();
+}
+
+/**
+ * The in-memory job queue does not survive a server restart. Any clip left in
+ * "pending" or "processing" was interrupted and will never resume on its own,
+ * so it would otherwise stay in that state forever. On startup we mark those
+ * rows as "error" with a clear message so the user can retry them.
+ */
+export async function reconcileInterruptedJobs(): Promise<void> {
+  try {
+    const interrupted = await db
+      .update(clipsTable)
+      .set({
+        status: "error",
+        progress: 0,
+        errorMessage:
+          "Processing was interrupted by a server restart. Click retry to run this clip again.",
+      })
+      .where(inArray(clipsTable.status, ["pending", "processing"]))
+      .returning({ id: clipsTable.id });
+
+    if (interrupted.length > 0) {
+      logger.warn(
+        { count: interrupted.length, ids: interrupted.map((c) => c.id) },
+        "Reconciled interrupted clip jobs after restart",
+      );
+    }
+  } catch (err) {
+    logger.error({ err }, "Failed to reconcile interrupted clip jobs");
+  }
+}
+
+export function getOutputDir(): string {
+  if (!fs.existsSync(OUTPUT_DIR)) {
+    fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+  }
+  return OUTPUT_DIR;
+}
+
+export function getOutputFilePath(filename: string): string {
+  return path.join(getOutputDir(), filename);
+}
+
+export function getUploadsDir(): string {
+  if (!fs.existsSync(UPLOADS_DIR)) {
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+  }
+  return UPLOADS_DIR;
+}
+
+export function getUploadFilePath(filename: string): string {
+  return path.join(getUploadsDir(), filename);
+}
+
+function findYtDlp(): string {
+  const candidates = [
+    "/home/runner/workspace/.pythonlibs/bin/yt-dlp",
+    "/usr/local/bin/yt-dlp",
+    "/usr/bin/yt-dlp",
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return "yt-dlp";
+}
+
+function findPython(): string {
+  const candidates = [
+    "/home/runner/workspace/.pythonlibs/bin/python3",
+    "/usr/local/bin/python3",
+    "/usr/bin/python3",
+    "python3",
+  ];
+  for (const c of candidates) {
+    if (c === "python3" || fs.existsSync(c)) return c;
+  }
+  return "python3";
+}
+
+// Path to the Python script that renders headline text (with emoji) to a PNG.
+// tsx sets __dirname to the artifact root, not the source file dir, so derive workspace root
+// by climbing until we find the scripts directory (or fall back to the known Replit path).
+function findWorkspaceRoot(): string {
+  let dir = __dirname;
+  for (let i = 0; i < 6; i++) {
+    if (fs.existsSync(path.join(dir, "scripts", "render_headline.py"))) return dir;
+    dir = path.dirname(dir);
+  }
+  // Stable fallback for Termux
+  return "/data/data/com.termux/files/home/myapp";
+}
+const RENDER_HEADLINE_SCRIPT = path.join(findWorkspaceRoot(), "scripts", "render_headline.py");
+const DETECT_OVERLAP_SCRIPT = path.join(findWorkspaceRoot(), "scripts", "detect_watermark_overlap.py");
+
+function findFont(): string {
+  for (const f of CAPTION_FONTS) {
+    if (fs.existsSync(f)) return f;
+  }
+  // Last resort: try Anton
+  if (fs.existsSync(ANTON_FONT)) return ANTON_FONT;
+  return CAPTION_FONTS[0]!;
+}
+
+function timeToSeconds(ts: string): number {
+  const parts = ts.split(":").map(Number);
+  if (parts.length === 3) return parts[0]! * 3600 + parts[1]! * 60 + parts[2]!;
+  if (parts.length === 2) return parts[0]! * 60 + parts[1]!;
+  return parts[0]!;
+}
+
+/**
+ * Normalises a YouTube URL so protocol/host casing differences don't trip up yt-dlp.
+ * e.g. "Https://youtu.be/..." → "https://youtu.be/..."
+ */
+export function normalizeYoutubeUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.includes("youtube.com")) {
+      if (parsed.pathname.startsWith("/live/")) {
+        const videoId = parsed.pathname.replace("/live/", "").split("/")[0];
+        return `https://www.youtube.com/watch?v=${videoId}`;
+      }
+      if (parsed.pathname.startsWith("/shorts/")) {
+        const videoId = parsed.pathname.replace("/shorts/", "").split("/")[0];
+        return `https://www.youtube.com/watch?v=${videoId}`;
+      }
+    }
+    return parsed.toString();
+  } catch {
+    return url.replace(/^https?:\/\//i, (m) => m.toLowerCase());
+  }
+}
+
+/**
+ * Extracts a clean, human-readable error from a raw yt-dlp / ffmpeg command error.
+ * Strips the "Command failed: ..." prefix and keeps only ERROR/WARNING lines.
+ */
+const NOISE_PATTERNS = [
+  /No supported JavaScript runtime/,
+  /js-runtimes RUNTIME/,
+  /youtube\.com\/watch/,
+];
+
+function isNoiseLine(line: string): boolean {
+  return NOISE_PATTERNS.some((re) => re.test(line));
+}
+
+export function parseProcessingError(raw: string): string {
+  // Detect process kill / timeout before parsing stderr content
+  if (/killed|timed out|SIGTERM|SIGKILL/i.test(raw) && !raw.includes("ERROR:")) {
+    return "Download timed out — the clip may be too long or the connection was slow. Try a shorter segment.";
+  }
+
+  const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
+
+  // Look for explicit ERROR lines first (most informative)
+  const errorLines = lines.filter((l) => l.startsWith("ERROR:"));
+  if (errorLines.length > 0) {
+    return errorLines
+      .map((l) => l.replace(/^ERROR:\s*\[youtube[^\]]*\]\s*[^:]+:\s*/, "").replace(/^ERROR:\s*/, ""))
+      .join(" | ")
+      .slice(0, 400);
+  }
+
+  // Fall back to meaningful WARNING lines (skip known noise)
+  const warnLines = lines.filter(
+    (l) => l.startsWith("WARNING:") && !isNoiseLine(l)
+  );
+  if (warnLines.length > 0) {
+    return warnLines.map((l) => l.replace(/^WARNING:\s*/, "")).join(" | ").slice(0, 400);
+  }
+
+  // Last resort: strip "Command failed: <command>" prefix, skip noise lines
+  const withoutCmd = raw.replace(/^Command failed:[^\n]+\n?/, "").trim();
+  const meaningfulLines = withoutCmd.split("\n").map((l) => l.trim()).filter((l) => l && !isNoiseLine(l));
+  const cleaned = meaningfulLines.join(" | ").slice(0, 300);
+  return cleaned || "Download failed — check the URL and timestamps.";
+}
+
+function escapeDrawtext(text: string): string {
+  return text
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\u2019")
+    .replace(/:/g, "\\\\:")
+    .replace(/\[/g, "\\\\[")
+    .replace(/\]/g, "\\\\]")
+    .replace(/,/g, "\\\\,")
+    .replace(/;/g, "\\\\;")
+    .replace(/\n/g, " ");
+}
+
+function wrapText(text: string, maxChars = 38): string[] {
+  const words = text.trim().split(/\s+/);
+  const lines: string[] = [];
+  let current = "";
+
+  for (const word of words) {
+    if (!current) {
+      current = word;
+    } else if ((current + " " + word).length <= maxChars) {
+      current += " " + word;
+    } else {
+      lines.push(current);
+      current = word;
+    }
+  }
+  if (current) lines.push(current);
+  return lines;
+}
+
+/**
+ * Creates a throttled progress updater for a clip. Writes at most once per second
+ * to avoid hammering the DB during long ffmpeg encodes.
+ */
+function makeProgressUpdater(clipId: number) {
+  let lastTime = 0;
+  return async (pct: number, force = false) => {
+    if (!clipId) return;
+    const now = Date.now();
+    if (!force && now - lastTime < 1000) return;
+    lastTime = now;
+    try {
+      await db
+        .update(clipsTable)
+        .set({ progress: Math.min(100, Math.max(0, Math.round(pct))) })
+        .where(eq(clipsTable.id, clipId));
+    } catch {
+      // Non-fatal — progress is best-effort
+    }
+  };
+}
+
+/**
+ * Spawns a child process, accumulates stderr for error reporting, and calls
+ * onLine for every line of output (both stdout and stderr) for progress parsing.
+ *
+ * stallTimeoutMs: if no output is received for this long, the process is killed.
+ * This catches silently hung downloads where the TCP connection stalls mid-transfer
+ * and ffmpeg waits forever for bytes that never arrive.
+ */
+function spawnProcess(
+  cmd: string,
+  args: string[],
+  timeoutMs: number,
+  onLine?: (line: string) => void,
+  stallTimeoutMs = 90_000
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // detached: true puts yt-dlp in its own process group so that killing the group
+    // also kills any grandchild ffmpeg processes spawned by yt-dlp. Without this,
+    // killing yt-dlp leaves internal ffmpeg running as an orphan indefinitely.
+    const proc = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], detached: true });
+    let stderrBuf = "";
+    let done = false;
+
+    function fail(msg: string) {
+      if (done) return;
+      done = true;
+      clearTimeout(hardTimer);
+      clearTimeout(stallTimer);
+      // Kill the entire process group (negative PID) to take down yt-dlp + its ffmpeg children
+      try { process.kill(-proc.pid!, "SIGKILL"); } catch { proc.kill("SIGKILL"); }
+      reject(new Error(msg));
+    }
+
+    // Stall timer: reset every time data arrives; fires if nothing comes for stallTimeoutMs
+    let stallTimer: ReturnType<typeof setTimeout>;
+    function resetStall() {
+      clearTimeout(stallTimer);
+      stallTimer = setTimeout(
+        () => fail(`killed|download stalled — no output for ${stallTimeoutMs / 1000}s\n${stderrBuf}`),
+        stallTimeoutMs
+      );
+    }
+    resetStall();
+
+    // Hard upper-bound timeout. timeoutMs <= 0 disables it entirely, leaving only
+    // the stall timer as the safety net — used for CPU-bound ffmpeg renders that can
+    // legitimately run very long on slow hardware (the phone) but still emit progress
+    // output regularly, so a genuine hang (no output for stallTimeoutMs) is still caught.
+    const hardTimer =
+      timeoutMs > 0
+        ? setTimeout(
+            () => fail(`killed|timed out after ${timeoutMs / 1000}s\n${stderrBuf}`),
+            timeoutMs
+          )
+        : undefined;
+
+    function handleData(chunk: Buffer, isStderr: boolean) {
+      resetStall();
+      const text = chunk.toString();
+      if (isStderr) stderrBuf += text;
+      if (onLine) {
+        // yt-dlp progress lines end with \r; split on both so they fire the callback.
+        for (const line of text.split(/\r?\n|\r/)) {
+          if (line.trim()) onLine(line);
+        }
+      }
+    }
+
+    proc.stdout.on("data", (c: Buffer) => handleData(c, false));
+    proc.stderr.on("data", (c: Buffer) => handleData(c, true));
+
+    proc.on("close", (code) => {
+      if (done) return;
+      done = true;
+      clearTimeout(hardTimer);
+      clearTimeout(stallTimer);
+      if (code === 0 || code === null) {
+        resolve();
+      } else {
+        reject(new Error(stderrBuf || `Process exited with code ${code}`));
+      }
+    });
+
+    proc.on("error", (err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(hardTimer);
+      clearTimeout(stallTimer);
+      reject(err);
+    });
+  });
+}
+
+/**
+ * Builds the base yt-dlp arg list shared by all download attempts.
+ */
+function buildYtDlpArgs(
+  section: string,
+  format: string,
+  outTemplate: string,
+  youtubeUrl: string,
+  cookiesArgs: string[],
+  extraArgs: string[] = []
+): string[] {
+  return [
+    "--no-playlist",
+    "--remote-components", "ejs:github",
+    "--download-sections", section,
+    // NOTE: --force-keyframes-at-cuts is intentionally omitted.
+    // On live recordings it spawns an internal ffmpeg that must seek through the entire
+    // CDN stream to reach the cut point, hanging indefinitely on long videos.
+    "--format", format,
+    "--merge-output-format", "mp4",
+    ...cookiesArgs,
+    ...extraArgs,
+    "-o", outTemplate,
+    "--no-part",
+    "--progress",
+    "--newline",
+    "--socket-timeout", "30",
+    "--retries", "10",
+    "--fragment-retries", "inf",
+    youtubeUrl,
+  ];
+}
+
+/**
+ * Downloads the exact time segment from YouTube using yt-dlp --download-sections.
+ *
+ * Strategy (all attempts are 720p+; we NEVER downgrade to 360p):
+ *   1. HLS 1080p (archived live streams).
+ *   2. DASH 1080p via native downloader + concurrent fragments.
+ *      --downloader native makes yt-dlp download each DASH segment individually from the
+ *      manifest, then ffmpeg muxes from local files. This avoids yt-dlp's internal ffmpeg
+ *      seeking sequentially through the full CDN stream (which hangs on archived live recordings
+ *      because it has to read through all content before the timestamp first).
+ *      --concurrent-fragments 4 downloads up to 4 segments in parallel for faster throughput.
+ *   3. 720p DASH via native downloader (same approach, smaller file).
+ *   4. Cookie-authed web client, 720p+ floor (last resort).
+ *
+ * Quality guarantee: a hard MIN_VIDEO_HEIGHT (720p) post-download check rejects any sub-720p
+ * result, and YouTube 429 throttling triggers a bounded backoff-retry of the SAME HD format
+ * rather than a silent drop to 360p. If no HD stream is obtainable, the job fails (retryable)
+ * instead of producing a low-quality clip.
+ *
+ * Returns the path to the downloaded temp file.
+ */
+async function downloadSegment(
+  ytDlp: string,
+  youtubeUrl: string,
+  startTime: string,
+  endTime: string,
+  tmpId: string,
+  onProgress: (pct: number) => void
+): Promise<string> {
+  const tmpDir = os.tmpdir();
+  const section = `*${startTime}-${endTime}`;
+  const cookiesArgs = getCookiesArgs();
+
+  // Native downloader args: download DASH segments individually (no full-stream seek),
+  // with 4 concurrent connections for faster throughput.
+  const nativeArgs = ["--downloader", "native", "--concurrent-fragments", "4", "--remote-components", "ejs:github"];
+
+  const attempts: Array<{ format: string; label: string; stallMs: number; hardMs: number; extraArgs?: string[] }> = [
+    {
+      // Property-based HLS selector (NOT bare itags): YouTube now splits HLS streams by audio
+      // language (301-0/301-1, 300-0/300-1, …), so bare "301"/"300" no longer match a single
+      // format and yt-dlp errors "Requested format is not available". This selector matches
+      // whichever 720-1080p HLS variant exists regardless of itag/language split. HLS streams are
+      // muxed (single file, no ffmpeg merge), so they sidestep the merge failures DASH can hit.
+      // 720p floor is enforced in the selector and re-checked post-download.
+      format: "best[height>=720][height<=1080][protocol^=m3u8]/best[height>=720][protocol^=m3u8]",
+      label: "HLS m3u8 (live stream)",
+      stallMs: 300_000,
+      hardMs: 900_000,
+      extraArgs: ["--extractor-args", "youtube:player_client=android_vr,web"],
+    },
+    {
+      format: "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080][ext=mp4]+bestaudio/bestvideo[height<=1080]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio",
+      label: "DASH 1080p (native)",
+      stallMs: 300_000,
+      hardMs: 900_000,
+      extraArgs: ["--downloader", "native", "--concurrent-fragments", "4", "--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=android_vr,web"],
+    },
+    {
+      format: "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720][ext=mp4]+bestaudio/bestvideo[height<=720]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio",
+      label: "DASH 720p (native)",
+      stallMs: 300_000,
+      hardMs: 600_000,
+      extraArgs: ["--downloader", "native", "--concurrent-fragments", "4", "--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=android_vr,web"],
+    },
+    {
+      // HD-floored last resort: cookie-authed web client (different from the android_vr
+      // attempts above), 720p minimum. We deliberately DO NOT fall back to 360p (fmt 18)
+      // or bare "best" — a 360p clip is worse than failing and retrying once the throttle
+      // clears. The post-download height check below enforces this floor for real.
+      format: "bestvideo[height>=720][height<=1080]+bestaudio/22/best[height>=720]",
+      label: "HD fallback (720p+ floor, cookies)",
+      stallMs: 300_000,
+      hardMs: 300_000,
+      extraArgs: ["--downloader", "native", "--concurrent-fragments", "4", "--remote-components", "ejs:github"],
+    },
+  ]
+
+  // Quality guarantee: never composite a source below this height. Under a YouTube 429
+  // throttle, only the tiny 360p progressive stream slips through, so a low-res result is
+  // itself a throttle symptom — we reject it (and retry HD) rather than ship a 360p clip.
+  const MIN_VIDEO_HEIGHT = 720;
+  // Bounded, shared backoff budget across all attempts so a persistent throttle errors out
+  // in a few minutes (retryable) instead of hanging — and never silently downgrades quality.
+  const RL_MAX_TOTAL = 3;
+  let rlRetriesTotal = 0;
+  const isRateLimited = (m: string) => /\b429\b/.test(m) || /too many requests/i.test(m);
+  const probeHeight = async (file: string): Promise<number> => {
+    try {
+      const { stdout } = await execFileAsync("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "csv=p=0", file], { timeout: 30_000 });
+      return parseInt(String(stdout).trim(), 10) || 0;
+    } catch { return 0; }
+  };
+
+  let lastError: Error = new Error("no attempts made");
+
+  for (const [i, attempt] of attempts.entries()) {
+    const attemptId = i === 0 ? tmpId : `${tmpId}_fb${i}`;
+    const outTemplate = path.join(tmpDir, `clip_raw_${attemptId}.%(ext)s`);
+
+    // Retry the SAME (HD) attempt on transient rate-limiting before stepping down.
+    for (;;) {
+      logger.info(
+        { youtubeUrl, startTime, endTime, section, format: attempt.format, attempt: i + 1 },
+        "Downloading segment via yt-dlp"
+      );
+
+      try {
+        await spawnProcess(
+          ytDlp,
+          buildYtDlpArgs(section, attempt.format, outTemplate, youtubeUrl, (attempt.extraArgs ?? []).join(" ").includes("android_vr") ? [] : cookiesArgs, attempt.extraArgs ?? []),
+          attempt.hardMs,
+          (line) => {
+            const m = line.match(/\[download\]\s+(\d+\.?\d*)%/);
+            if (m) {
+              const ytPct = parseFloat(m[1]!);
+              // Map yt-dlp's 0-100% → overall progress 2-48%
+              onProgress(ytPct * 0.45);
+            }
+          },
+          attempt.stallMs
+        );
+
+        // Locate the output file
+        const candidates = ["mp4", "mkv", "webm"].map((ext) => path.join(tmpDir, `clip_raw_${attemptId}.${ext}`));
+        let outFile = candidates.find((c) => fs.existsSync(c)) ?? null;
+        if (!outFile) {
+          const files = fs.readdirSync(tmpDir).filter((f) => f.startsWith(`clip_raw_${attemptId}`));
+          if (files.length > 0) outFile = path.join(tmpDir, files[0]!);
+        }
+        if (!outFile) throw new Error("yt-dlp finished but no output file found");
+
+        // Hard quality floor — reject and retry rather than composite sub-720p.
+        const h = await probeHeight(outFile);
+        if (h && h < MIN_VIDEO_HEIGHT) {
+          try { fs.unlinkSync(outFile); } catch { /* ignore */ }
+          throw new Error(`downloaded video is ${h}p, below the ${MIN_VIDEO_HEIGHT}p quality floor`);
+        }
+        return outFile;
+      } catch (err) {
+        lastError = err as Error;
+        const msg = lastError.message;
+        const belowFloor = msg.includes("quality floor");
+
+        // Transient 429 (or a throttle-induced low-res result): back off and retry the
+        // SAME HD format, preserving resolution. Bounded by a shared budget.
+        if ((isRateLimited(msg) || belowFloor) && rlRetriesTotal < RL_MAX_TOTAL) {
+          rlRetriesTotal++;
+          const backoffMs = 15_000 * rlRetriesTotal; // 15s, 30s, 45s
+          logger.warn(
+            { attempt: attempt.label, rlRetry: rlRetriesTotal, backoffMs, error: msg.slice(0, 150) },
+            "YouTube rate-limited (429) / low-res — backing off, then retrying the same HD format"
+          );
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue; // retry SAME attempt
+        }
+
+        // Any other failure — a format-not-available, an ffmpeg/mux error (e.g. "ffmpeg exited
+        // with code 8" on a fragile 1080p60 DASH section), a network drop, a stall — is NOT fatal
+        // on its own. Step to the NEXT download strategy; we only give up once the LAST attempt has
+        // failed. This guarantees one flaky format can never sink the whole download. (Previously a
+        // non-whitelisted error such as the ffmpeg mux failure aborted the chain before ever trying
+        // the lower-bitrate 720p DASH / HD-fallback attempts, which usually succeed.)
+        if (i === attempts.length - 1) {
+          // All HD strategies exhausted.
+          if (isRateLimited(msg) || belowFloor) {
+            throw new Error("YouTube is rate-limiting downloads (HTTP 429) and no HD (720p+) stream came through. Quality floor held (no 360p). Wait a few minutes and retry this clip.");
+          }
+          throw lastError;
+        }
+
+        logger.warn(
+          { attempt: attempt.label, error: msg.slice(0, 200) },
+          `Download failed on ${attempt.label}; stepping to next strategy: ${attempts[i + 1]!.label}`
+        );
+        break; // step to the next (still HD) attempt
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+// The six AI auto-zoom effects. Gemini picks one per moment; the ffmpeg expressions
+// for each are built in processClip (all sharp lanczos scale+crop — never zoompan).
+type ZoomType = "punch" | "whip" | "cut" | "pushin" | "pullout" | "kenburns";
+
+interface ZoomEvent { sec: number; type: ZoomType; }
+
+// Normalised (alnum-only, lowercase) keyword -> canonical type, so we tolerate the
+// variants Gemini may emit ("push-in", "ken burns", "zoom out", "snap", ...).
+const ZOOM_ALIASES: Record<string, ZoomType> = {
+  punch: "punch", punchin: "punch", punchzoom: "punch",
+  whip: "whip", snap: "whip", whipzoom: "whip", snapzoom: "whip",
+  cut: "cut", hardcut: "cut", jumpcut: "cut", cutzoom: "cut",
+  pushin: "pushin", push: "pushin", zoomin: "pushin", pushzoom: "pushin",
+  pullout: "pullout", pull: "pullout", zoomout: "pullout", reveal: "pullout", pullback: "pullout",
+  kenburns: "kenburns", ken: "kenburns", burns: "kenburns", pan: "kenburns",
+};
+
+/**
+ * Parses AI auto-zoom events the user pastes from Gemini. Each event is a SECOND plus
+ * an optional zoom TYPE, e.g. "3 punch, 9 pushin, 16 kenburns". Tolerates bare seconds
+ * (defaults to punch, back-compatible), mm:ss timestamps, and comma/semicolon/newline
+ * separators. Clamps inside the clip, sorts, enforces a 1.2s min gap so zooms can't
+ * stack and over-crop, caps at 10.
+ */
+function parseZoomEvents(raw: string, duration: number): ZoomEvent[] {
+  if (!raw || !raw.trim()) return [];
+  const chunks = raw.split(/[,;\n]+/).map((c) => c.trim()).filter(Boolean);
+  const events: ZoomEvent[] = [];
+  for (const chunk of chunks) {
+    let sec: number | null = null;
+    let type: ZoomType = "punch";
+    for (const tok of chunk.split(/\s+/).filter(Boolean)) {
+      const low = tok.toLowerCase().replace(/[^a-z0-9:.]/g, "");
+      if (!low) continue;
+      if (ZOOM_ALIASES[low]) { type = ZOOM_ALIASES[low]; continue; }
+      if (sec !== null) continue;
+      let s: number;
+      if (low.includes(":")) {
+        const parts = low.split(":").map(Number);
+        if (parts.some((n) => Number.isNaN(n))) continue;
+        s = parts.reduce((a, n) => a * 60 + n, 0);
+      } else {
+        s = Number(low);
+      }
+      if (Number.isFinite(s)) sec = s;
+    }
+    if (sec === null || !Number.isFinite(sec)) continue;
+    if (sec < 0.5 || sec > duration - 0.3) continue;
+    events.push({ sec: Math.round(sec * 10) / 10, type });
+  }
+  events.sort((a, b) => a.sec - b.sec);
+  const out: ZoomEvent[] = [];
+  for (const e of events) {
+    if (out.length && e.sec - out[out.length - 1].sec < 1.2) continue;
+    out.push(e);
+  }
+  return out.slice(0, 10);
+}
+
+/** Evenly-spaced punches (~every 5s) when auto-zoom is on but no AI events were given. */
+function defaultZoomEvents(duration: number): ZoomEvent[] {
+  const out: ZoomEvent[] = [];
+  for (let t = 5; t < duration - 0.5; t += 5) out.push({ sec: t, type: "punch" });
+  return out.slice(0, 10);
+}
+
+export async function processClip(
+  youtubeUrl: string | null,
+  startTime: string,
+  endTime: string,
+  headline: string,
+  outputFilename: string,
+  mode: "edited" | "raw" = "edited",
+  channelHandle = "",
+  clipId = 0,
+  localFilePath?: string,
+  frameStyle: "standard" | "immersive" = "immersive",
+  sourceChannel = "",
+  captionsEnabled = true,
+  outroEnabled = true,
+  voiceoverEnabled = false,
+  voiceoverHook = "",
+  punchInEnabled = false,
+  zoomMoments = "",
+  // Pro 2: the transformative editing format and, for "essay", the full narration script the
+  // user pasted from Gemini. In essay mode Piper speaks the whole essayScript over the clip with
+  // the source audio ducked underneath (the short voiceoverHook stays the intro-only path).
+  format = "essay",
+  essayScript = ""
+): Promise<void> {
+  const isLocalFile = !!localFilePath;
+  const ytDlp = findYtDlp();
+  const outputDir = getOutputDir();
+  const finalOutputPath = path.join(outputDir, outputFilename);
+
+  const startSeconds = timeToSeconds(startTime);
+  const endSeconds = timeToSeconds(endTime);
+  const duration = endSeconds - startSeconds;
+
+  if (duration <= 0) throw new Error("End time must be after start time");
+
+  const updateProgress = makeProgressUpdater(clipId);
+
+  // Unique ID for temp files per clip to avoid collisions between concurrent jobs
+  const tmpId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+  let tmpInputPath: string | null = null;
+
+  try {
+    if (isLocalFile) {
+      // Step 1 (local): file already on disk — skip yt-dlp entirely
+      tmpInputPath = localFilePath;
+      logger.info({ tmpInputPath, mode }, "Using local uploaded file");
+      await updateProgress(5, true);
+    } else {
+      // Step 1 (YouTube): download the exact segment — reports 2-48% progress
+      await updateProgress(0, true);
+      tmpInputPath = await downloadSegment(
+        ytDlp,
+        youtubeUrl!,
+        startTime,
+        endTime,
+        tmpId,
+        (pct) => { void updateProgress(pct); }
+      );
+      logger.info({ tmpInputPath, mode }, "Segment downloaded");
+      await updateProgress(45, true);
+    }
+
+    // Raw mode: for local files trim with ffmpeg copy; for YouTube just copy the downloaded segment
+    if (mode === "raw") {
+      if (isLocalFile) {
+        await spawnProcess("ffmpeg", [
+          "-y",
+          "-ss", startTime,
+          "-i", tmpInputPath,
+          "-t", String(duration),
+          "-c", "copy",
+          finalOutputPath,
+        ], 300_000);
+      } else {
+        fs.copyFileSync(tmpInputPath, finalOutputPath);
+      }
+      logger.info({ finalOutputPath }, "Raw clip saved (no compositing)");
+      return;
+    }
+
+    logger.info({ tmpInputPath }, "Building filter graph for edited mode");
+
+    // Step 2: Render headline text to a transparent PNG via Python.
+    // This handles emoji (pilmoji/Twemoji) which ffmpeg drawtext cannot render.
+    const canvasW = 1080;
+    const canvasH = 1920;
+    const videoW = 1080;
+    const videoH = frameStyle === "standard" ? 608 : 1350;
+    const videoY = 240;    // top bar for title; 240 (not 200) drops the title + frame
+                           // ~40px so the headline clears YouTube's top UI (back/search/
+                           // menu icons). Bottom bar stays 330px — ample for the watermark.
+
+    const fontSize = 96;
+    const lineSpacing = 14;
+
+    const fontFile = findFont();
+    // Headlines render in Anton (bold condensed display face) — its capital "I"
+    // is a thick full-height bar that can't be mistaken for a lowercase "l", and
+    // it gives the punchy, professional look expected of Shorts titles.
+    const headlineFont = fs.existsSync(ANTON_FONT) ? ANTON_FONT : fontFile;
+    let tmpPngPath: string | null = null;
+    let pngHeight = 0;
+
+    if (headline && headline.trim()) {
+      tmpPngPath = path.join(os.tmpdir(), `clip_hl_${tmpId}.png`);
+      const renderParams = JSON.stringify({
+        // Upper-case for the bold Shorts headline style (also removes any
+        // remaining ambiguity between similar glyphs).
+        text: headline.toUpperCase(),
+        font_path: headlineFont,
+        font_size: fontSize,
+        line_spacing: lineSpacing,
+        max_chars: 28,
+        canvas_width: canvasW,
+        // Keep the title block inside the top bar (videoY tall) with breathing room.
+        max_height: videoY - 40,
+        output_path: tmpPngPath,
+      });
+      const python3 = findPython();
+      const renderOutput = await execFileAsync(python3, [RENDER_HEADLINE_SCRIPT, renderParams], { timeout: 30000 });
+      const renderResult = JSON.parse(renderOutput.stdout.trim()) as { height: number; lines: number };
+      pngHeight = renderResult.height;
+      logger.info({ tmpPngPath, pngHeight, lines: renderResult.lines }, "Headline PNG rendered");
+    }
+
+    await updateProgress(45, true);
+
+    // Position: center the headline PNG vertically in the top white bar
+    const hlY = Math.max(30, Math.floor((videoY - pngHeight) / 2));
+
+    // Detect if the source video already has a logo/watermark in the bottom-center
+    // area where our channel handle would go, and shift ours right if so.
+    let handleX = "(w-text_w)/2";
+    if (channelHandle && channelHandle.trim() && tmpInputPath) {
+      try {
+        const framePath = path.join(os.tmpdir(), `clip_frame_${tmpId}.png`);
+        await spawnProcess("ffmpeg", [
+          "-y",
+          "-ss", String(duration / 2),
+          "-i", tmpInputPath,
+          "-vf", `scale=${videoW}:${videoH}:force_original_aspect_ratio=increase,crop=${videoW}:${videoH}`,
+          "-vframes", "1",
+          framePath,
+        ], 30000);
+
+        const python3 = findPython();
+        const detectParams = JSON.stringify({
+          frame_path: framePath,
+          region_w: 360,
+          region_h: 50,
+          frame_w: videoW,
+          frame_h: videoH,
+        });
+        const detectOutput = await execFileAsync(python3, [DETECT_OVERLAP_SCRIPT, detectParams], { timeout: 15000 });
+        const detectResult = JSON.parse(detectOutput.stdout.trim()) as { busy: boolean; stddev: number };
+        logger.info({ detectResult }, "Watermark overlap detection");
+        if (detectResult.busy) {
+          handleX = "w-text_w-40";
+        }
+      } catch (err) {
+        logger.warn({ err }, "Watermark overlap detection failed \u2014 using centered position");
+      }
+    }
+
+    // AI auto-zoom: at each moment Gemini chose (or evenly-spaced defaults) apply the
+    // zoom TYPE it picked. ALL six types are a lanczos animated scale + crop driven by a
+    // per-frame zoom factor Z(t) — NEVER zoompan (which blurred badly and forced 25/30fps).
+    // This keeps the source frame rate and stays sharp. Each effect is a localised bump on
+    // Z(t) that is always >= 0, so Z >= 1 everywhere → the scale never goes below the output
+    // size → no upscale-from-smaller → no blur. Expressions stay comma-free (commas would
+    // split the filtergraph) — |u| via sqrt(u*u), squaring via self-multiply, no pow/^.
+    let punchInChain = "";
+    if (punchInEnabled) {
+      const parsed = parseZoomEvents(zoomMoments, duration);
+      const events = parsed.length ? parsed : defaultZoomEvents(duration);
+      const zTerms: string[] = [];   // added to the zoom factor Z(t)
+      const panXTerms: string[] = []; // crop-centre horizontal drift (Ken Burns only)
+      const panYTerms: string[] = []; // crop-centre vertical drift (Ken Burns only)
+      let kbIdx = 0;
+      for (const ev of events) {
+        const c = ev.sec.toFixed(2);
+        const u = `(t-${c})`;                       // time relative to the moment
+        const up = `((${u}+sqrt(${u}*${u}))/2)`;    // max(u,0): the "after" half
+        const un = `((${u}-sqrt(${u}*${u}))/2)`;    // min(u,0): the "before" half
+        switch (ev.type) {
+          case "whip": {            // fast, strong snap
+            const a = `(${u}/0.16)`;
+            zTerms.push(`0.34*exp(-${a}*${a})`);
+            break;
+          }
+          case "cut": {             // near-rectangular hold (super-gaussian, 4th power)
+            const q = `(${u}/0.55)`;
+            const q2 = `(${q}*${q})`;
+            zTerms.push(`0.24*exp(-${q2}*${q2})`);
+            break;
+          }
+          case "pushin": {          // slow build-in, quicker release
+            const ar = `(${un}/1.30)`;
+            const af = `(${up}/0.70)`;
+            zTerms.push(`0.20*exp(-${ar}*${ar}-${af}*${af})`);
+            break;
+          }
+          case "pullout": {         // snap in, slow reveal out
+            const ar = `(${un}/0.22)`;
+            const af = `(${up}/1.50)`;
+            zTerms.push(`0.22*exp(-${ar}*${ar}-${af}*${af})`);
+            break;
+          }
+          case "kenburns": {        // gentle wide zoom + slow diagonal pan
+            const a = `(${u}/1.40)`;
+            zTerms.push(`0.14*exp(-${a}*${a})`);
+            const dir = kbIdx % 2 === 0 ? 1 : -1;   // alternate drift so adjacent KBs differ
+            const pw = `(${u}/1.20)`;               // odd drift u*exp(-u^2): sweeps through centre
+            panXTerms.push(`${(dir * 1.20).toFixed(2)}*${pw}*exp(-${pw}*${pw})`);
+            panYTerms.push(`${(-dir * 1.40).toFixed(2)}*${pw}*exp(-${pw}*${pw})`);
+            kbIdx++;
+            break;
+          }
+          case "punch":
+          default: {                // quick symmetric zoom in/out (the original)
+            const a = `(${u}/0.45)`;
+            zTerms.push(`0.18*exp(-${a}*${a})`);
+            break;
+          }
+        }
+      }
+      if (zTerms.length) {
+        const zExpr = `1${zTerms.map((t) => `+${t}`).join("")}`;
+        const scalePart = `scale=w=ceil(${videoW}*(${zExpr})/2)*2:h=ceil(${videoH}*(${zExpr})/2)*2:eval=frame:flags=lanczos`;
+        let cropPart = `crop=${videoW}:${videoH}`;
+        if (panXTerms.length || panYTerms.length) {
+          // Offset the centre crop by a fraction of the available margin. The margin
+          // ((in_w-W)/2) shrinks to 0 as Z→1, and |pan|<1, so x/y stay in [0, in-out].
+          // ffmpeg 8.x evaluates crop x/y per-frame by default (no `eval` option — it
+          // was removed), so the t-driven pan animates without it.
+          const panX = panXTerms.length ? panXTerms.join("+") : "0";
+          const panY = panYTerms.length ? panYTerms.join("+") : "0";
+          cropPart = `crop=${videoW}:${videoH}:x=(in_w-${videoW})/2*(1+(${panX})):y=(in_h-${videoH})/2*(1+(${panY}))`;
+        }
+        punchInChain = `,${scalePart},${cropPart}`;
+        const typeCounts = events.reduce<Record<string, number>>((m, e) => { m[e.type] = (m[e.type] ?? 0) + 1; return m; }, {});
+        logger.info({ events, typeCounts, source: parsed.length ? "ai" : "default" }, "AI auto-zoom (multi-type) applied");
+      }
+    }
+
+    // Step 3: Build ffmpeg filter graph
+    // Inputs: [0] = downloaded video clip, [1] = headline PNG (if headline is set)
+    const extraInputs: string[] = [];
+    const filters: string[] = [
+      // Split the source: one copy becomes a blurred, dimmed full-frame backdrop
+      // (true "immersive" look), the other is the sharp centred video.
+      `[0:v]split=2[vsrc][vbg]`,
+      `[vbg]scale=216:384:force_original_aspect_ratio=increase,crop=216:384,gblur=sigma=9,scale=${canvasW}:${canvasH}:flags=bilinear,eq=brightness=-0.30:saturation=1.15[bg]`,
+      `[vsrc]scale=${videoW}:${videoH}:force_original_aspect_ratio=increase:flags=lanczos,crop=${videoW}:${videoH}${punchInChain},unsharp=5:5:1.0:5:5:0.0[vid]`,
+      `[bg][vid]overlay=0:${videoY}[composedv]`,
+      // Soft dark scrims behind the title and handle so white text stays legible
+      // over the blurred backdrop.
+      `[composedv]drawbox=x=0:y=0:w=${canvasW}:h=${videoY}:color=black@0.30:t=fill[scrimtop]`,
+      `[scrimtop]drawbox=x=0:y=${videoY + videoH}:w=${canvasW}:h=${canvasH - videoY - videoH}:color=black@0.30:t=fill[composedsc]`,
+      `[composedsc]drawbox=x=0:y=${videoY - 3}:w=${canvasW}:h=3:color=FF0000:t=fill[composedac]`,
+      // ffmpeg drawtext: the colon must be backslash-escaped even inside single
+      // quotes ('Credit\: KSI'), else the filtergraph fails to parse. \\ in the
+      // template literal -> a single literal backslash in the filter string.
+      sourceChannel && sourceChannel.trim() ? `[composedac]drawtext=text='Credit\\: ${sourceChannel.trim().replace(/'/g,"")}':fontsize=24:fontcolor=white@0.85:x=w-text_w-16:y=${videoY + videoH - 36}:shadowx=1:shadowy=1:shadowcolor=black@0.9[composed]` : `[composedac]null[composed]`,
+    ];
+    let prevLabel = "composed";
+
+    if (tmpPngPath && pngHeight > 0) {
+      // -loop 1 makes the still PNG repeat for the full video duration; -t (below) cuts it
+      extraInputs.push("-loop", "1", "-i", tmpPngPath);
+      filters.push(`[1:v]format=rgba[hl]`);
+      filters.push(`[${prevLabel}][hl]overlay=x=0:y=${hlY}[after_hl]`);
+      prevLabel = "after_hl";
+    }
+
+    // Channel handle watermark: small white text with shadow near the bottom of the video frame
+    if (channelHandle && channelHandle.trim()) {
+      // Watermark uses Anton (bold condensed display face, same as the headline) in
+      // uppercase so it reads strongly. It lives in the black bar below the video, so
+      // it is always horizontally centered — the source-watermark overlap shift in
+      // handleX only matters for text drawn over the video frame, not down here.
+      const safeHandle = escapeDrawtext(channelHandle.trim().toUpperCase());
+      const handleFont = fs.existsSync(ANTON_FONT) ? ANTON_FONT : (fs.existsSync(WATERMARK_FONT) ? WATERMARK_FONT : fontFile);
+      const handleFontSize = 48;
+      const handleY = videoY + videoH + Math.floor((canvasH - videoY - videoH - handleFontSize) / 2);  // vertically centered in bottom bar
+      filters.push(
+        `[${prevLabel}]drawtext=` +
+        `text='${safeHandle}':` +
+        `fontfile='${handleFont}':` +
+        `fontsize=${handleFontSize}:` +
+        `fontcolor=white:` +
+        `borderw=3:bordercolor=black@0.55:` +
+        `shadowx=2:shadowy=2:shadowcolor=black@0.85:` +
+        `x=(w-text_w)/2:` +
+        `y=${handleY}` +
+        `[pre_outro]`
+      );
+    } else {
+      filters.push(`[${prevLabel}]null[pre_outro]`);
+    }
+
+    if (outroEnabled) {
+      // Outro card: last 2 seconds = black overlay + styled end screen
+      const outroStart = Math.max(0, duration - 2);
+      const safeHandleOutro = (channelHandle || '').replace(/'/g, '').trim();
+      filters.push(
+        // Black overlay
+        `[pre_outro]drawbox=x=0:y=0:w=${canvasW}:h=${canvasH}:color=black@1:t=fill:enable='gte(t,${outroStart})'[ob]`,
+        // Thin red accent line top
+        `[ob]drawbox=x=340:y=700:w=400:h=3:color=FF0000:t=fill:enable='gte(t,${outroStart})'[ol1]`,
+        // Channel handle
+        `[ol1]drawtext=text='${safeHandleOutro}':fontsize=44:fontcolor=white:x=(w-text_w)/2:y=750:enable='gte(t,${outroStart})'[ol2]`,
+        // Red subscribe button background
+        `[ol2]drawbox=x=${Math.floor((canvasW - 380) / 2)}:y=830:w=380:h=80:color=FF0000:t=fill:enable='gte(t,${outroStart})'[ol3]`,
+        // SUBSCRIBE text inside red button
+        `[ol3]drawtext=text='SUBSCRIBE':fontsize=42:fontcolor=white:x=(w-text_w)/2:y=848:enable='gte(t,${outroStart})'[ol4]`,
+        // Thin red accent line bottom
+        `[ol4]drawbox=x=340:y=940:w=400:h=3:color=FF0000:t=fill:enable='gte(t,${outroStart})'[out]`
+      );
+    } else {
+      filters.push(`[pre_outro]null[out]`);
+    }
+
+    const filterComplex = filters.join(";");
+
+    // Detect whether the source has an audio track so we can (a) safely apply an
+    // audio filter and (b) fade the audio out under the outro card instead of
+    // letting dialogue play over the subscribe screen.
+    let hasAudio = false;
+    try {
+      const probe = await execFileAsync("ffprobe", [
+        "-v", "error", "-select_streams", "a",
+        "-show_entries", "stream=index", "-of", "csv=p=0", tmpInputPath,
+      ], { timeout: 15000 });
+      hasAudio = probe.stdout.trim().length > 0;
+    } catch { /* assume no audio */ }
+
+    // Build the audio filter chain. When the source has audio we always normalise
+    // loudness to YouTube's target (-14 LUFS integrated, -1.5 dBTP true peak) so
+    // every clip sounds consistent and at the platform's reference level instead
+    // of whatever the source happened to be. Single-pass loudnorm is light enough
+    // for the phone; two-pass would be more accurate but needs a separate analysis
+    // run. Then, if the outro card is enabled, gently duck the audio out across the
+    // last 3s so it's already quiet by the time the subscribe screen appears.
+    const audioFilterChain: string[] = [];
+    if (hasAudio) {
+      // Correct any initial audio/video offset introduced by yt-dlp's keyframe-imprecise
+      // section cut (video and audio can start a hair apart → lips out of sync at the start).
+      audioFilterChain.push("aresample=async=1");
+      audioFilterChain.push("loudnorm=I=-14:TP=-1.5:LRA=11");
+      if (outroEnabled) {
+        audioFilterChain.push(`afade=t=out:st=${Math.max(0, duration - 3)}:d=3`);
+      }
+    }
+    const outroAudioFade = audioFilterChain.length
+      ? ["-af", audioFilterChain.join(",")]
+      : [];
+
+    // Step 4: Run ffmpeg, reporting 55-95% progress by parsing time= lines
+    // For local files, add fast input-side seek (-ss before -i) so ffmpeg trims precisely
+    const ffmpegArgs: string[] = [
+      "-y",
+      ...(isLocalFile ? ["-ss", startTime] : []),
+      "-i", tmpInputPath,
+      ...extraInputs,
+      "-filter_complex", filterComplex,
+      "-map", "[out]",
+      "-map", "0:a?",
+      ...outroAudioFade,
+      "-c:v", "libx264",
+      "-threads", "1",
+      "-preset", "veryfast",
+      "-crf", "14",
+
+      "-pix_fmt", "yuv420p",
+      "-c:a", "aac",
+      "-b:a", "256k",
+      "-t", String(duration),
+      "-movflags", "+faststart",
+      finalOutputPath,
+    ];
+
+    logger.info({ pngHeight, channelHandle, fontFile }, "Starting ffmpeg");
+
+    // No hard timeout: the immersive composite is CPU-bound and can run long on the
+    // phone. ffmpeg prints a progress line per ~second, so the 90s stall timer still
+    // kills a genuine hang. (Was 600000 — too short for 1080p renders on slow ARM.)
+    await spawnProcess("ffmpeg", ffmpegArgs, 0, (line) => {
+      // ffmpeg progress: "... time=00:00:04.10 ..."
+      const m = line.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
+      if (m) {
+        const elapsed =
+          parseInt(m[1]!) * 3600 + parseInt(m[2]!) * 60 + parseFloat(m[3]!);
+        const ratio = Math.min(elapsed / duration, 1);
+        // Map ffmpeg 0-100% → overall 55-95%
+        void updateProgress(45 + ratio * 50);
+      }
+    });
+
+    logger.info({ finalOutputPath }, "Clip processing complete");
+
+    // Extract best frame as thumbnail (non-fatal)
+    if (clipId) {
+      const thumbPath = path.join(outputDir, `clip_${clipId}_thumb.jpg`);
+      try {
+        await spawnProcess("ffmpeg", [
+          "-y", "-i", finalOutputPath,
+          "-vf", "thumbnail=300",
+          "-frames:v", "1",
+          thumbPath,
+        ], 60000, () => {});
+        logger.info({ thumbPath }, "Thumbnail extracted");
+      } catch (thumbErr) {
+        logger.warn({ thumbErr }, "Thumbnail extraction failed (non-fatal)");
+      }
+
+      // Generate captions via whisper.cpp + burn into video (non-fatal). Track the outcome so a
+      // whisper OOM/crash (which leaves the clip uncaptioned) is recorded in the DB instead of
+      // being silently shipped as a finished clip. Starts "failed"; flips to "ok"/"skipped" on a
+      // clean run. See memory: render-oom-crash.
+      let captionStatus: "ok" | "skipped" | "failed" = "failed";
+      if (captionsEnabled) try {
+        const srtPath = path.join(outputDir, `clip_${clipId}_captions.srt`);
+        const transcriptPath = path.join(outputDir, `clip_${clipId}_transcript.txt`);
+        const captionScript = path.join(SCRIPTS_DIR, "generate_captions_pro.sh");
+        const captionedPath = path.join(outputDir, `clip_${clipId}_captioned.mp4`);
+
+        if (fs.existsSync(captionScript)) {
+          await new Promise<void>((resolve) => {
+            // 30 min cap: whisper small.en is slow on the phone (~6 min for a ~45s clip);
+            // 5 min was too short and silently dropped captions on longer segments.
+            const cap = spawn("bash", [captionScript, finalOutputPath, srtPath, transcriptPath], { timeout: 1_800_000 });
+            cap.on("close", () => resolve());
+            cap.on("error", () => resolve());
+          });
+
+          if (fs.existsSync(transcriptPath)) {
+            try {
+              const transcript = fs.readFileSync(transcriptPath, "utf8").trim();
+              if (transcript) {
+                await db.update(clipsTable).set({ transcript }).where(eq(clipsTable.id, clipId));
+              }
+            } catch { /* non-fatal */ }
+            fs.unlinkSync(transcriptPath);
+          }
+
+          if (fs.existsSync(srtPath)) {
+            // Convert the cleaned SRT into animated word-by-word ("karaoke")
+            // captions (active word highlighted). Fall back to a plain bold-SRT
+            // burn if the converter is missing or produces nothing.
+            // NB: Anton is great for the PIL-rendered headline, but libass
+            // double-renders it into a ghosted outline — captions use DejaVu Sans.
+            const assPath = path.join(outputDir, `clip_${clipId}_captions.ass`);
+            // DTW karaoke: word-level highlighting from whisper's per-token DTW
+            // timestamps (JSON emitted alongside the SRT by generate_captions_pro.sh),
+            // so each word lights up exactly when spoken. Falls back to the plain
+            // SRT burn if the JSON/converter is missing or yields no Dialogue lines.
+            const dtwJsonPath = srtPath.replace(/\.srt$/, ".json");
+            const karaokeScript = path.join(SCRIPTS_DIR, "karaoke_captions_pro.py");
+            let subFilter = `subtitles=${srtPath}:fontsdir=${FONTS_DIR}:force_style='FontName=DejaVu Sans,FontSize=12,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,Bold=1,Alignment=2,MarginV=95'`;
+            let haveAss = false;
+            if (fs.existsSync(karaokeScript) && fs.existsSync(dtwJsonPath)) {
+              try {
+                // Caption cutoff = where the outro subscribe card starts (last 2s),
+                // so captions don't sit over it. With the outro OFF there is no card,
+                // so let captions run to the very end (was wrongly clipping the final 2s).
+                const captionEnd = outroEnabled ? Math.max(0, duration - 2) : duration;
+                await execFileAsync(findPython(), [karaokeScript, dtwJsonPath, assPath, String(captionEnd)], { timeout: 30000 });
+                if (fs.existsSync(assPath) && fs.readFileSync(assPath, "utf8").includes("Dialogue:")) {
+                  subFilter = `subtitles=${assPath}:fontsdir=${FONTS_DIR}`;
+                  haveAss = true;
+                }
+              } catch (kErr) {
+                logger.warn({ kErr }, "Karaoke caption generation failed — falling back to plain SRT");
+              }
+            }
+
+            // A no-speech / non-English segment yields an empty SRT and no ASS
+            // Dialogue lines. Burning an empty subtitle file makes ffmpeg error,
+            // so skip the burn entirely and leave the clip uncaptioned.
+            const srtHasContent = (() => {
+              try { return fs.readFileSync(srtPath, "utf8").trim().length > 0; }
+              catch { return false; }
+            })();
+
+            if (haveAss || srtHasContent) {
+              await spawnProcess("ffmpeg", [
+                "-y", "-i", finalOutputPath,
+                "-vf", subFilter,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-threads", "1",
+                "-c:a", "copy",
+                captionedPath,
+                // No hard timeout — caption burn is another full crf-14 re-encode that
+                // can also exceed 10 min on the phone; stall timer still guards hangs.
+              ], 0, () => {});
+
+              if (fs.existsSync(captionedPath)) {
+                fs.renameSync(captionedPath, finalOutputPath);
+                captionStatus = "ok";
+                logger.info({ finalOutputPath, mode: haveAss ? "dtw-karaoke" : "srt" }, "Captions burned into clip");
+              }
+            } else {
+              // Clean whisper run, but no transcribable speech — a legitimate uncaptioned clip,
+              // not a failure.
+              captionStatus = "skipped";
+              logger.info({ clipId }, "No speech detected in segment — skipping caption burn");
+            }
+            fs.existsSync(srtPath) && fs.unlinkSync(srtPath);
+            fs.existsSync(assPath) && fs.unlinkSync(assPath);
+            fs.existsSync(dtwJsonPath) && fs.unlinkSync(dtwJsonPath);
+          }
+        }
+      } catch (capErr) {
+        captionStatus = "failed";
+        logger.warn({ capErr }, "Caption generation failed (non-fatal)");
+      }
+
+      // Record the caption outcome so a captionless clip is never silently passed off as
+      // complete. "failed" almost always means whisper was OOM-killed on the phone — surface it
+      // loudly (the clip still renders, just without captions). Non-fatal: never throws.
+      if (captionsEnabled) {
+        try {
+          await db.update(clipsTable).set({ captionStatus }).where(eq(clipsTable.id, clipId));
+        } catch (statusErr) {
+          logger.warn({ statusErr, clipId }, "Failed to persist caption status");
+        }
+        if (captionStatus === "failed") {
+          logger.error({ clipId }, "Caption stage produced nothing (likely OOM/whisper crash) — clip shipped WITHOUT captions");
+        }
+      }
+
+      // Pro 2: AI narration (Piper TTS, local). Two shapes share this pass:
+      //   • Essay format — speak the FULL pasted essayScript over the whole clip, ducking the
+      //     source audio underneath for the entire narration (the "video-essay" feel that makes
+      //     the clip read as transformative).
+      //   • Legacy intro-hook — speak a short hook line over just the first few seconds.
+      // Either way it's a cheap audio-only pass (video stream copied, only audio re-encoded),
+      // so it adds negligible time even on the phone. Non-fatal.
+      const isEssay = format === "essay" && !!essayScript && essayScript.trim().length > 0;
+      const narrationText = isEssay
+        ? essayScript.trim()
+        : (voiceoverEnabled && voiceoverHook && voiceoverHook.trim() ? voiceoverHook.trim() : "");
+      if (narrationText) try {
+        const hookWav = path.join(outputDir, `clip_${clipId}_hook.wav`);
+        const voiceScript = path.join(SCRIPTS_DIR, "generate_voiceover.sh");
+
+        if (fs.existsSync(voiceScript)) {
+          await new Promise<void>((resolve) => {
+            const v = spawn("bash", [voiceScript, narrationText, hookWav], { timeout: 180_000 });
+            v.on("close", () => resolve());
+            v.on("error", () => resolve());
+          });
+
+          if (fs.existsSync(hookWav)) {
+            // Duck the original for the narration's length + a short pad. For an essay this
+            // spans (and is capped at) the whole clip; for a hook it releases to full volume
+            // right after the hook finishes.
+            let hookDur = 5;
+            try {
+              const hp = await execFileAsync("ffprobe", [
+                "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", hookWav,
+              ], { timeout: 10000 });
+              hookDur = parseFloat(hp.stdout.trim()) || 5;
+            } catch { /* default */ }
+            const duckEnd = (hookDur + 0.6).toFixed(2);
+            // Essay narration carries the video, so duck the source harder; a short hook only
+            // needs the source dipped so the line is audible over it.
+            const duckVol = isEssay ? "0.15" : "0.22";
+
+            // Does the current file still have an audio stream to duck under the hook?
+            let voiceHasAudio = false;
+            try {
+              const p = await execFileAsync("ffprobe", [
+                "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+                "-of", "csv=p=0", finalOutputPath,
+              ], { timeout: 10000 });
+              voiceHasAudio = p.stdout.trim().length > 0;
+            } catch { /* assume none */ }
+
+            // Normalise both inputs to 48kHz stereo before amix (avoids sample-rate /
+            // channel-layout mismatches between the aac source and the 22kHz mono hook),
+            // sum without auto-attenuation (normalize=0), then loudnorm the result.
+            const audioFilter = voiceHasAudio
+              ? `[0:a]volume=enable='lt(t,${duckEnd})':volume=${duckVol},aresample=48000,aformat=channel_layouts=stereo[duck];` +
+                `[1:a]adelay=300:all=1,aresample=48000,aformat=channel_layouts=stereo[hk];` +
+                `[duck][hk]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aout]`
+              : `[1:a]adelay=300:all=1,aresample=48000,aformat=channel_layouts=stereo,loudnorm=I=-14:TP=-1.5:LRA=11[aout]`;
+
+            const voicedPath = path.join(outputDir, `clip_${clipId}_voiced.mp4`);
+            await spawnProcess("ffmpeg", [
+              "-y", "-i", finalOutputPath, "-i", hookWav,
+              "-filter_complex", audioFilter,
+              "-map", "0:v", "-map", "[aout]",
+              "-c:v", "copy", "-c:a", "aac", "-b:a", "256k",
+              "-movflags", "+faststart",
+              voicedPath,
+            ], 300_000, () => {});
+
+            if (fs.existsSync(voicedPath)) {
+              fs.renameSync(voicedPath, finalOutputPath);
+              logger.info({ finalOutputPath, hookDur, format: isEssay ? "essay" : "hook" }, "AI narration mixed in");
+            }
+            fs.existsSync(hookWav) && fs.unlinkSync(hookWav);
+          } else {
+            logger.warn("Voiceover WAV not produced — skipping narration mix");
+          }
+        }
+      } catch (voErr) {
+        logger.warn({ voErr }, "Voiceover generation failed (non-fatal)");
+      }
+    }
+  } finally {
+    // Clean up all temp files for this job (video segment + headline PNG).
+    try {
+      const tmpDir = os.tmpdir();
+      const leftovers = fs
+        .readdirSync(tmpDir)
+        .filter((f) => f.includes(tmpId));
+      for (const f of leftovers) {
+        const p = path.join(tmpDir, f);
+        if (fs.existsSync(p)) {
+          fs.unlinkSync(p);
+          logger.info({ tmpFile: p }, "Cleaned up temp file");
+        }
+      }
+    } catch (cleanupErr) {
+      logger.warn({ cleanupErr, tmpId }, "Failed to clean up temp files");
+    }
+  }
+}
